@@ -1,438 +1,448 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import pandas as pd
+#!/usr/bin/env python3
+"""
+GWNN pipeline using top 10k features (enhanced version).
+- Loads X_final_inverted_with_labels.csv
+- Loads top_10000_features_by_fclassif.csv (one feature name per line)
+- Uses only available features from that ranked list (up to 10k)
+- Stratified splits, imputes NaNs (mean), BorderlineSMOTE on training-only
+- Builds weighted kNN graph on combined nodes (BorderlineSMOTE_train + val + test)
+- Computes m_eigs spectral components with eigsh
+- Trains deeper GWNN (3 layers, Focal Loss, LR scheduler, early stop on macro-F1)
+- Threshold tuning on val for binary decision
+- Adds XGBoost baseline for comparison
+- Evaluates and saves plots/artifacts
+
+Requirements:
+  pip install numpy pandas scikit-learn imbalanced-learn scipy matplotlib torch xgboost
+"""
+import os
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.impute import KNNImputer
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.neighbors import NearestNeighbors
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, accuracy_score, confusion_matrix
-import scipy.sparse as sp
-from scipy.sparse.linalg import eigsh
+import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
-from imblearn.over_sampling import SMOTE
 import warnings
 warnings.filterwarnings('ignore')
 
-class GraphWaveletLayer(nn.Module):
-    """
-    Graph Wavelet Convolution Layer based on Xu et al. (ICLR 2019)
-    Implements spectral graph wavelets with learnable filters, vectorized for efficiency
-    """
-    def __init__(self, in_channels, out_channels, num_wavelets=4, K=64):
-        super(GraphWaveletLayer, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.num_wavelets = num_wavelets
-        self.K = K  # Number of eigenvectors
+# Core
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import laplacian as sparse_laplacian
+from scipy.sparse.linalg import eigsh
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics import (
+    accuracy_score, precision_recall_fscore_support, confusion_matrix,
+    roc_curve, auc, f1_score
+)
 
-        # Learnable wavelet parameters
-        self.wavelet_scales = nn.Parameter(torch.linspace(0.1, 2.0, num_wavelets))
-        self.wavelet_filters = nn.Parameter(torch.randn(num_wavelets, in_channels, out_channels))
-        self.bias = nn.Parameter(torch.zeros(out_channels))
+# Enhanced SMOTE
+from imblearn.over_sampling import BorderlineSMOTE
 
-        # Learnable kernel parameters for g(λ)
-        self.kernel_params = nn.Parameter(torch.randn(num_wavelets, 3))
-        self.reset_parameters()
+# PyTorch
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-    def reset_parameters(self):
-        nn.init.xavier_uniform_(self.wavelet_filters)
-        nn.init.uniform_(self.wavelet_scales, 0.1, 2.0)
-        nn.init.normal_(self.kernel_params, 0, 0.1)
+# XGBoost baseline
+import xgboost as xgb
 
-    def raised_cosine_kernel(self, eigenvals, scale, params):
-        """Raised cosine wavelet kernel g(λ)"""
-        a, b, c = params
-        lambda_scaled = eigenvals / scale
-        kernel = torch.zeros_like(lambda_scaled)
-        mask = (lambda_scaled >= a) & (lambda_scaled <= b)
-        kernel[mask] = 0.5 * (1 + torch.cos(np.pi * (lambda_scaled[mask] - a) / (b - a)))
-        return kernel + c * torch.exp(-lambda_scaled**2)
+# ---------------------------
+# USER CONFIG
+# ---------------------------
+DATA_CSV = os.path.expanduser("~/Downloads/X_final_inverted_with_labels.csv")
+TOP_FEATURES_CSV = os.path.expanduser("~/Downloads/top_10000_features_by_fclassif.csv")
+OUTPUT_DIR = "./gwnn_outputs_enhanced"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    def compute_wavelet_operator(self, eigenvals, eigenvecs):
-        """Compute graph wavelet operator ψ(Λ) = diag((g(Λ) - γ g(Λ/s))^2)"""
-        gamma = 0.5
-        wavelet_ops = []
-        for i, scale in enumerate(self.wavelet_scales):
-            g_lambda = self.raised_cosine_kernel(eigenvals, scale, self.kernel_params[i])
-            g_lambda_scaled = self.raised_cosine_kernel(eigenvals, scale * 2.0, self.kernel_params[i])
-            psi_lambda = (g_lambda - gamma * g_lambda_scaled) ** 2
-            psi_diag = torch.diag(psi_lambda)
-            wavelet_op = eigenvecs @ psi_diag @ eigenvecs.T
-            wavelet_ops.append(wavelet_op)
-        return torch.stack(wavelet_ops, dim=0)
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
-    def forward(self, x, eigenvals, eigenvecs):
-        """Forward pass: Vectorized wavelet convolution"""
-        num_nodes, in_channels = x.size()
-        device = x.device
-        wavelet_ops = self.compute_wavelet_operator(eigenvals.to(device), eigenvecs.to(device))
+TEST_SIZE = 0.20
+VAL_SIZE = 0.20  # fraction of the remaining training for validation (so final val ~ 0.2*0.8 = 0.16)
+SMOTE_K = 5
+KNN_K = 10  # Increased for denser graph
+KNN_METRIC = 'cosine'
+M_EIGS = 200
+HIDDEN_DIM = 128  # Increased for deeper model
+HIDDEN_DIM2 = 64
+DROPOUT = 0.5
+LR = 0.001  # Lowered
+WEIGHT_DECAY = 5e-4
+N_EPOCHS = 200
+EARLY_STOPPING_PATIENCE = 30
+SCHEDULER_PATIENCE = 10
+FOCAL_ALPHA = 0.25
+FOCAL_GAMMA = 2.0
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # Vectorized computation across all wavelets
-        wavelet_x = torch.einsum('wnm,mi->wni', wavelet_ops, x)  # [num_wavelets, num_nodes, in_channels]
-        spectral_x = torch.einsum('kn,wni->wki', eigenvecs.T, wavelet_x)  # [num_wavelets, K, in_channels]
-        filtered = torch.einsum('wki,wio->wko', spectral_x, self.wavelet_filters)  # [num_wavelets, K, out_channels]
-        spatial_output = torch.einsum('nk,wko->nwo', eigenvecs, filtered)  # [num_nodes, num_wavelets, out_channels]
-        output = spatial_output.mean(dim=1) + self.bias  # [num_nodes, out_channels]
-        return output
+print("="*80)
+print("Enhanced GWNN pipeline (top 10k features)")
+print("Device:", DEVICE)
+print("="*80)
+
+# ---------------------------
+# 1) Load data and top features
+# ---------------------------
+print("\n[1] Loading data and top feature list")
+df = pd.read_csv(DATA_CSV)
+print("Raw dataframe shape:", df.shape)
+
+if 'chemo_resistant' not in df.columns:
+    raise ValueError("Input CSV must have a 'chemo_resistant' column")
+
+# Load top features file; supports either single-column CSV or plain text
+top_df = pd.read_csv(TOP_FEATURES_CSV, header=None)
+top_list = top_df.iloc[:, 1].astype(str).tolist()
+print(f"Top-list length (requested): {len(top_list)}")
+
+# Filter to features that actually exist in df
+available_features = [f for f in top_list if f in df.columns]
+if len(available_features) == 0:
+    raise ValueError("No top features found in dataframe columns. Check names / paths.")
+print(f"Available top features found in dataset: {len(available_features)} (using these)")
+
+# Extract X and y
+X_full = df[available_features].values.astype(np.float32)  # shape: (n_samples, n_features_used)
+y_full = df['chemo_resistant'].values.astype(np.int64)               # expects labels as ints starting anywhere
+
+n_samples, n_features = X_full.shape
+print(f"Data shape using top features: X={X_full.shape}, y={y_full.shape}")
+
+# ---------------------------
+# 2) Pre-scale (recommended)
+# ---------------------------
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_full)  # mean=0, var=1 per feature
+
+# ---------------------------
+# 3) Stratified train/val/test split (do this BEFORE SMOTE)
+# ---------------------------
+print("\n[2] Stratified split (train/val/test)")
+X_temp, X_test, y_temp, y_test = train_test_split(X_scaled, y_full, test_size=TEST_SIZE,
+                                                  stratify=y_full, random_state=SEED)
+X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=VAL_SIZE,
+                                                  stratify=y_temp, random_state=SEED)
+
+print("Sizes: train, val, test =", X_train.shape[0], X_val.shape[0], X_test.shape[0])
+print("Train label counts:", dict(zip(*np.unique(y_train, return_counts=True))))
+print("Val label counts:", dict(zip(*np.unique(y_val, return_counts=True))))
+print("Test label counts:", dict(zip(*np.unique(y_test, return_counts=True))))
+
+# ---------------------------
+# 4) Impute NaNs (use train statistics) and then BorderlineSMOTE on train-only
+# ---------------------------
+print("\n[3] Imputation (mean) and BorderlineSMOTE on training set only")
+
+imputer = SimpleImputer(strategy='mean')
+X_train_imp = imputer.fit_transform(X_train)
+X_val_imp = imputer.transform(X_val)
+X_test_imp = imputer.transform(X_test)
+
+# class weights computed from original pre-SMOTE training distribution (for XGBoost)
+unique_train, counts_train = np.unique(y_train, return_counts=True)
+n_classes = int(np.max(y_full) + 1)  # handle sparse label values
+# build class_weights across label range 0..max_label
+class_weights_arr = np.ones(n_classes, dtype=np.float32)
+for cls, cnt in zip(unique_train, counts_train):
+    class_weights_arr[int(cls)] = (len(y_train) / (len(unique_train) * cnt)).astype(np.float32)
+print("Class weights (pre-SMOTE training):", class_weights_arr)
+
+sm = BorderlineSMOTE(k_neighbors=SMOTE_K, random_state=SEED)
+X_train_res, y_train_res = sm.fit_resample(X_train_imp, y_train)
+print("Resampled train size:", X_train_res.shape, y_train_res.shape)
+print("Resampled train distribution:", dict(zip(*np.unique(y_train_res, return_counts=True))))
+
+# ---------------------------
+# 5) Build combined dataset for graph: BorderlineSMOTE_train + val + test
+# ---------------------------
+print("\n[4] Combine nodes for graph (BorderlineSMOTE-train + val + test)")
+X_combined = np.vstack([X_train_res, X_val_imp, X_test_imp])
+y_combined = np.concatenate([y_train_res, y_val, y_test])
+n_nodes = X_combined.shape[0]
+n_train_nodes = X_train_res.shape[0]
+n_val_nodes = X_val_imp.shape[0]
+n_test_nodes = X_test_imp.shape[0]
+print("Combined nodes:", n_nodes, "(train, val, test) =", (n_train_nodes, n_val_nodes, n_test_nodes))
+
+# ---------------------------
+# 6) Build weighted kNN adjacency (sparse)
+# ---------------------------
+print("\n[5] Building weighted kNN graph (sparse) on combined dataset")
+nbrs = NearestNeighbors(n_neighbors=KNN_K + 1, metric=KNN_METRIC, n_jobs=-1).fit(X_combined)
+distances, indices = nbrs.kneighbors(X_combined)
+
+# Compute weights: 1 / (1 + dist) for similarity emphasis
+weights = 1.0 / (1.0 + distances[:, 1:])
+
+rows = []
+cols = []
+data = []
+for i in range(n_nodes):
+    for j_idx, j in enumerate(indices[i, 1:], 1):
+        w = weights[i, j_idx-1]
+        rows.append(i); cols.append(int(j)); data.append(w)
+        rows.append(int(j)); cols.append(i); data.append(w)
+
+A_sparse = csr_matrix((data, (rows, cols)), shape=(n_nodes, n_nodes))
+A_sparse.sum_duplicates()
+print("Adjacency sparse shape:", A_sparse.shape, "nnz:", A_sparse.nnz)
+
+# ---------------------------
+# 7) Normalized Laplacian and eigendecomposition (reduced)
+# ---------------------------
+print("\n[6] Normalized Laplacian -> spectral decomposition (eigsh)")
+L_sparse = sparse_laplacian(A_sparse, normed=True)
+
+m_eigs = min(M_EIGS, n_nodes - 2) if n_nodes > 2 else n_nodes
+m_eigs = max(2, m_eigs)
+print(f"Computing {m_eigs} smallest eigenpairs (this can take time)...")
+try:
+    eigvals, eigvecs = eigsh(L_sparse, k=m_eigs, which='SM', tol=1e-5, maxiter=5000)
+except Exception as e:
+    print("eigsh failed (fallback):", e)
+    denseL = L_sparse.toarray()
+    eigvals_full, eigvecs_full = np.linalg.eigh(denseL)
+    eigvals = eigvals_full[:m_eigs]
+    eigvecs = eigvecs_full[:, :m_eigs]
+
+print("Eigenvalues range:", eigvals.min(), eigvals.max())
+print("Eigenvectors shape:", eigvecs.shape)
+
+# ---------------------------
+# 8) Focal Loss for multiclass (binary here)
+# ---------------------------
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1-pt)**self.gamma * ce_loss
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+# ---------------------------
+# 9) Convert to torch and define deeper GWNN
+# ---------------------------
+print("\n[7] Convert to torch and build deeper GWNN model (Focal Loss)")
+
+X_t = torch.FloatTensor(X_combined).to(DEVICE)
+y_t = torch.LongTensor(y_combined).to(DEVICE)
+eigvals_t = torch.from_numpy(eigvals.astype(np.float32)).to(DEVICE)
+eigvecs_t = torch.from_numpy(eigvecs.astype(np.float32)).to(DEVICE)
+
+class GraphWaveletConv(nn.Module):
+    def __init__(self, in_features, out_features, eigvals, eigvecs, scale=1.0):
+        super().__init__()
+        # register spectral basis and filter arrays as buffers
+        self.register_buffer('eigvals', eigvals)   # (m,)
+        self.register_buffer('eigvecs', eigvecs)   # (n, m)
+        self.linear = nn.Linear(in_features, out_features)
+        # wavelet filters (spectral)
+        self.register_buffer('g', torch.exp(-scale * eigvals))
+        self.register_buffer('g_inv', torch.exp(scale * eigvals))
+
+    def forward(self, x):
+        # x: (n, in_features)
+        U = self.eigvecs         # (n, m)
+        Ut = U.t()               # (m, n)
+        x_spec = Ut @ x          # (m, in_features)
+        x_spec_f = self.g_inv.unsqueeze(1) * x_spec   # (m, in_features)
+        x_spat = U @ x_spec_f    # (n, in_features)
+        x_lin = self.linear(x_spat)   # (n, out_features)
+        x_spec2 = Ut @ x_lin
+        x_spec2_f = self.g.unsqueeze(1) * x_spec2
+        x_out = U @ x_spec2_f
+        return x_out
 
 class GWNN(nn.Module):
-    """Graph Wavelet Neural Network for chemotherapy resistance prediction"""
-    def __init__(self, input_dim, hidden_dim=128, num_classes=1, num_wavelets=4, K=64, dropout=0.5):
-        super(GWNN, self).__init__()
-        self.gwnn1 = GraphWaveletLayer(input_dim, hidden_dim, num_wavelets, K)
-        self.gwnn2 = GraphWaveletLayer(hidden_dim, hidden_dim, num_wavelets, K)
-        self.gwnn3 = GraphWaveletLayer(hidden_dim, hidden_dim, num_wavelets, K)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
-        self.bn3 = nn.BatchNorm1d(hidden_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, num_classes)
-        )
+    def __init__(self, in_features, hidden_dim, hidden_dim2, n_classes, eigvals, eigvecs, dropout=0.5):
+        super().__init__()
+        self.conv1 = GraphWaveletConv(in_features, hidden_dim, eigvals, eigvecs, scale=1.0)
+        self.conv2 = GraphWaveletConv(hidden_dim, hidden_dim2, eigvals, eigvecs, scale=1.0)
+        self.conv3 = GraphWaveletConv(hidden_dim2, n_classes, eigvals, eigvecs, scale=1.0)
+        self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, eigenvals, eigenvecs, mask):
-        """Forward pass with node mask for transductive learning"""
-        num_nodes = x.size(0)
-        device = x.device
-        idx = torch.nonzero(mask).squeeze()
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.conv2(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.conv3(x)
+        return x
 
-        x = self.gwnn1(x, eigenvals, eigenvecs)
-        x_masked = x[idx]
-        x_masked = self.bn1(x_masked)
-        x_masked = F.relu(x_masked)
-        x_masked = self.dropout(x_masked)
-        x_full = torch.zeros(num_nodes, x_masked.size(1), device=device)
-        x_full[idx] = x_masked
-        x = x_full
+in_features = X_t.shape[1]
+n_classes_total = int(np.max(y_full) + 1)
+model = GWNN(in_features, HIDDEN_DIM, HIDDEN_DIM2, n_classes_total, eigvals_t, eigvecs_t, dropout=DROPOUT).to(DEVICE)
+print(model)
 
-        x = self.gwnn2(x, eigenvals, eigenvecs)
-        x_masked = x[idx]
-        x_masked = self.bn2(x_masked)
-        x_masked = F.relu(x_masked)
-        x_masked = self.dropout(x_masked)
-        x_full = torch.zeros(num_nodes, x_masked.size(1), device=device)
-        x_full[idx] = x_masked
-        x = x_full
+criterion = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA)
+optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = ReduceLROnPlateau(optimizer, mode='max', patience=SCHEDULER_PATIENCE, factor=0.5, verbose=True)
 
-        x = self.gwnn3(x, eigenvals, eigenvecs)
-        x_masked = x[idx]
-        x_masked = self.bn3(x_masked)
-        x_masked = F.relu(x_masked)
-        x_masked = self.dropout(x_masked)
+# indices in combined array
+train_idx = np.arange(0, n_train_nodes, dtype=np.int64)
+val_idx = np.arange(n_train_nodes, n_train_nodes + n_val_nodes, dtype=np.int64)
+test_idx = np.arange(n_train_nodes + n_val_nodes,
+                     n_train_nodes + n_val_nodes + n_test_nodes, dtype=np.int64)
 
-        x_masked = self.mlp(x_masked)
-        return x_masked
+# ---------------------------
+# 10) Training (full-batch) w/ early stopping on macro-F1
+# ---------------------------
+print("\n[8] Training (full-batch)")
 
-def load_and_preprocess_data(csv_path='tcga_rna_chemo.csv'):
-    """Load and preprocess TCGA RNA-seq data or generate synthetic data"""
-    try:
-        df = pd.read_csv(csv_path)
-        print(f"Loaded {len(df)} samples from {csv_path}")
-    except FileNotFoundError:
-        print(f"CSV not found. Generating synthetic data for demonstration...")
-        df = generate_synthetic_data(n_samples=32, n_genes=100)
-        df = extend_dataset(df, target_size=286)
-        print(f"Generated {len(df)} synthetic samples")
+best_val = -1.0
+patience_cnt = 0
+train_losses = []
+val_scores = []
+epochs_recorded = []
 
-    patient_ids = df['patient_id'].values
-    target = df['chemo_resistant'].values
-    rna_features = df.drop(['patient_id', 'chemo_resistant'], axis=1)
+for epoch in range(1, N_EPOCHS + 1):
+    model.train()
+    optimizer.zero_grad()
+    logits = model(X_t)
+    loss = criterion(logits[train_idx], y_t[train_idx])
+    loss.backward()
+    optimizer.step()
 
-    imputer = KNNImputer(n_neighbors=5)
-    rna_imputed = imputer.fit_transform(rna_features)
-    scaler = MinMaxScaler()
-    rna_scaled = scaler.fit_transform(rna_imputed)
+    train_losses.append(loss.item())
 
-    print(f"RNA features shape: {rna_scaled.shape}")
-    print(f"Target distribution: {np.bincount((target * 2).astype(int)) / 2}")
-    return rna_scaled, target, patient_ids
-
-def generate_synthetic_data(n_samples=32, n_genes=100):
-    """Generate synthetic RNA-seq data"""
-    np.random.seed(42)
-    data = []
-    for i in range(n_samples):
-        patient_id = f"TCGA-04-{1330+i:04d}"
-        rna_values = np.random.lognormal(0, 2, n_genes) * np.random.exponential(10, n_genes)
-        rna_values[rna_values < 0.01] = 0
-        missing_mask = np.random.random(n_genes) < 0.05
-        rna_values[missing_mask] = np.nan
-        resistance_prob = np.random.random()
-        chemo_resistant = 0.0 if resistance_prob < 0.4 else 0.5 if resistance_prob < 0.7 else 1.0
-        row = {'patient_id': patient_id, 'chemo_resistant': chemo_resistant}
-        for j in range(n_genes):
-            row[f'RNA_GENE_{j:03d}'] = rna_values[j]
-        data.append(row)
-    return pd.DataFrame(data)
-
-def extend_dataset(df, target_size=286):
-    """Extend dataset to target size using SMOTE-like technique"""
-    current_size = len(df)
-    if current_size >= target_size:
-        return df
-    numerical_cols = [col for col in df.columns if col not in ['patient_id', 'chemo_resistant']]
-    X = df[numerical_cols].fillna(0).values
-    y = df['chemo_resistant'].values
-    n_synthetic = target_size - current_size
-    smote = SMOTE(random_state=42, k_neighbors=min(5, len(df)-1))
-    y_discrete = (y * 2).astype(int)
-    try:
-        X_synthetic, y_synthetic = smote.fit_resample(X, y_discrete)
-        X_new = X_synthetic[current_size:][:n_synthetic]
-        y_new = y_synthetic[current_size:][:n_synthetic] / 2.0
-        new_rows = []
-        for i, (x_row, y_val) in enumerate(zip(X_new, y_new)):
-            row = {'patient_id': f"SYNTH-{i:04d}", 'chemo_resistant': y_val}
-            for j, col in enumerate(numerical_cols):
-                row[col] = x_row[j]
-            new_rows.append(row)
-        return pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
-    except Exception as e:
-        print(f"SMOTE failed: {e}. Using duplication with noise.")
-        extended_df = df.copy()
-        while len(extended_df) < target_size:
-            sample_idx = np.random.choice(len(df))
-            new_row = df.iloc[sample_idx].copy()
-            new_row['patient_id'] = f"DUP-{len(extended_df):04d}"
-            for col in numerical_cols:
-                if pd.notna(new_row[col]):
-                    new_row[col] *= np.random.normal(1.0, 0.05)
-            extended_df = pd.concat([extended_df, new_row.to_frame().T], ignore_index=True)
-        return extended_df[:target_size]
-
-def build_knn_graph(features, k=10):
-    """Build k-NN graph based on cosine similarity"""
-    print(f"Building {k}-NN graph...")
-    nbrs = NearestNeighbors(n_neighbors=k+1, metric='cosine', algorithm='brute').fit(features)
-    distances, indices = nbrs.kneighbors(features)
-    edges = []
-    for i in range(len(features)):
-        for j in range(1, k+1):
-            edges.extend([[i, indices[i, j]], [indices[i, j], i]])
-        edges.append([i, i])
-    edges = list(set(tuple(edge) for edge in edges))
-    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-    print(f"Graph constructed with {edge_index.size(1)} edges")
-    return edge_index
-
-def compute_laplacian_eigenvectors(edge_index, num_nodes, K=64):
-    """Compute normalized Laplacian eigenvectors and eigenvalues"""
-    print(f"Computing top {K} eigenvectors...")
-    adj_matrix = sp.coo_matrix((np.ones(edge_index.size(1)), (edge_index[0], edge_index[1])),
-                              shape=(num_nodes, num_nodes)).tocsr()
-    degrees = np.array(adj_matrix.sum(axis=1)).flatten()
-    D_inv_sqrt = sp.diags(1.0 / np.sqrt(np.maximum(degrees, 1e-8)))
-    I = sp.eye(num_nodes)
-    L_norm = I - D_inv_sqrt @ adj_matrix @ D_inv_sqrt
-    try:
-        eigenvals, eigenvecs = eigsh(L_norm, k=min(K, num_nodes-1), which='SM')
-        eigenvals = torch.tensor(eigenvals, dtype=torch.float32)
-        eigenvecs = torch.tensor(eigenvecs, dtype=torch.float32)
-    except Exception as e:
-        print(f"Eigendecomposition failed: {e}. Using identity.")
-        eigenvals = torch.linspace(0, 2, min(K, num_nodes-1))
-        eigenvecs = torch.eye(num_nodes)[:, :min(K, num_nodes-1)]
-    print(f"Computed {len(eigenvals)} eigenvalues")
-    return eigenvals, eigenvecs
-
-def train_gwnn(model, X, y, eigenvals, eigenvecs, train_mask, val_mask, num_epochs=200, patience=20):
-    """Train GWNN in transductive setting"""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
-    X = X.to(device)
-    y = y.to(device)
-    eigenvals = eigenvals.to(device)
-    eigenvecs = eigenvecs.to(device)
-    train_mask = train_mask.to(device)
-    val_mask = val_mask.to(device)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
-    criterion = nn.MSELoss()
-
-    train_losses, val_losses = [], []
-    best_val_loss = float('inf')
-    patience_counter = 0
-
-    print(f"Training on {device} for {num_epochs} epochs...")
-    for epoch in range(num_epochs):
-        model.train()
-        optimizer.zero_grad()
-        out = model(X, eigenvals, eigenvecs, train_mask).squeeze()
-        loss = criterion(out, y[train_mask])
-        loss.backward()
-        optimizer.step()
-        train_losses.append(loss.item())
-
+    # validation check
+    if epoch % 5 == 0 or epoch == 1:
         model.eval()
         with torch.no_grad():
-            out_val = model(X, eigenvals, eigenvecs, val_mask).squeeze()
-            val_loss = criterion(out_val, y[val_mask])
-            val_losses.append(val_loss.item())
+            logits_eval = model(X_t)
+            probs_val = torch.softmax(logits_eval[val_idx], dim=1).cpu().numpy()
+            preds_val = logits_eval[val_idx].argmax(dim=1).cpu().numpy()
+            y_val_true = y_t[val_idx].cpu().numpy()
+            val_f1 = f1_score(y_val_true, preds_val, average='macro', zero_division=0)
+        val_scores.append(val_f1)
+        epochs_recorded.append(epoch)
+        print(f"Epoch {epoch:03d}  TrainLoss={loss.item():.4f}  ValMacroF1={val_f1:.4f}")
 
-        if epoch % 10 == 0:
-            print(f'Epoch {epoch:03d}: Train Loss={train_losses[-1]:.4f}, Val Loss={val_losses[-1]:.4f}')
+        scheduler.step(val_f1)
 
-        if val_losses[-1] < best_val_loss:
-            best_val_loss = val_losses[-1]
-            patience_counter = 0
-            torch.save(model.state_dict(), 'best_gwnn_model.pth')
+        if val_f1 > best_val + 1e-6:
+            best_val = val_f1
+            patience_cnt = 0
+            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "best_gwnn_enhanced.pt"))
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f'Early stopping at epoch {epoch}')
+            patience_cnt += 1
+            if patience_cnt >= EARLY_STOPPING_PATIENCE:
+                print("Early stopping triggered.")
                 break
 
-    model.load_state_dict(torch.load('best_gwnn_model.pth'))
-    return train_losses, val_losses
+# save simple plots
+plt.figure(figsize=(10,4))
+plt.plot(train_losses, label="Train Loss")
+plt.xlabel("Iteration")
+plt.ylabel("Loss")
+plt.title("Training Loss")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "train_loss.png"), dpi=150)
+plt.close()
 
-def evaluate_model(model, X, y, eigenvals, eigenvecs, test_mask, patient_ids_test):
-    """Evaluate the trained model"""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.eval()
-    X = X.to(device)
-    eigenvals = eigenvals.to(device)
-    eigenvecs = eigenvecs.to(device)
-    test_mask = test_mask.to(device)
+plt.figure(figsize=(6,4))
+plt.plot(epochs_recorded, val_scores, marker='o', label="Val Macro F1")
+plt.xlabel("Epoch")
+plt.ylabel("Validation Macro F1")
+plt.title("Validation Macro F1")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "val_f1.png"), dpi=150)
+plt.close()
+print("Saved training plots to", OUTPUT_DIR)
 
-    with torch.no_grad():
-        predictions = model(X, eigenvals, eigenvecs, test_mask).squeeze().cpu().numpy()
-    true_labels = y[test_mask].cpu().numpy()
+# ---------------------------
+# 11) Threshold tuning on val for binary decision
+# ---------------------------
+print("\nThreshold tuning on validation set")
+model.eval()
+with torch.no_grad():
+    logits_val = model(X_t)
+    probs_val = torch.softmax(logits_val[val_idx], dim=1).cpu().numpy()  # probs for class 1: [:,1]
 
-    mse = mean_squared_error(true_labels, predictions)
-    mae = mean_absolute_error(true_labels, predictions)
-    r2 = r2_score(true_labels, predictions)
+best_thresh = 0.5
+best_f1_val = 0.0
+for thresh in np.arange(0.1, 0.6, 0.05):
+    preds_thresh = (probs_val[:, 1] > thresh).astype(int)
+    f1_thresh = f1_score(y_val_true, preds_thresh, average='macro', zero_division=0)
+    if f1_thresh > best_f1_val:
+        best_f1_val = f1_thresh
+        best_thresh = thresh
+print(f"Best threshold on val: {best_thresh:.2f} (Macro F1: {best_f1_val:.4f})")
 
-    pred_discrete = np.round(predictions * 2) / 2
-    pred_discrete = np.clip(pred_discrete, 0, 1)
+# ---------------------------
+# 12) Evaluation on test (best model, tuned threshold)
+# ---------------------------
+print("\n[9] Evaluation on test set (best model, tuned threshold)")
 
-    true_labels_int = (true_labels * 2).astype(int)
-    pred_discrete_int = (pred_discrete * 2).astype(int)
-    accuracy = accuracy_score(true_labels_int, pred_discrete_int)
+model.load_state_dict(torch.load(os.path.join(OUTPUT_DIR, "best_gwnn_enhanced.pt"), map_location=DEVICE))
+model.eval()
+with torch.no_grad():
+    logits_test = model(X_t)
+    probs_test = torch.softmax(logits_test[test_idx], dim=1).cpu().numpy()
+    preds_test_thresh = (probs_test[:, 1] > best_thresh).astype(int)
+    y_test_true = y_t[test_idx].cpu().numpy()
 
-    print(f"Test MSE: {mse:.4f}")
-    print(f"Test MAE: {mae:.4f}")
-    print(f"Test R²: {r2:.4f}")
-    print(f"Discretized Accuracy: {accuracy:.4f}")
+acc_test_thresh = accuracy_score(y_test_true, preds_test_thresh)
+prec_macro, rec_macro, f1_macro, _ = precision_recall_fscore_support(y_test_true, preds_test_thresh, average='macro', zero_division=0)
+print(f"Test Accuracy (tuned): {acc_test_thresh:.4f}")
+print(f"Macro Precision (tuned): {prec_macro:.4f}, Macro Recall (tuned): {rec_macro:.4f}, Macro F1 (tuned): {f1_macro:.4f}")
 
-    results_df = pd.DataFrame({
-        'patient_id': patient_ids_test,
-        'true': true_labels,
-        'pred': predictions
-    })
-    results_df.to_csv('gwnn_predictions.csv', index=False)
-    print("Predictions saved to gwnn_predictions.csv")
+print("\nPer-class metrics (tuned):")
+p_r_f = precision_recall_fscore_support(y_test_true, preds_test_thresh, labels=np.unique(y_test_true), zero_division=0)
+for idx, cls in enumerate(np.unique(y_test_true)):
+    print(f" Class {cls}: Precision={p_r_f[0][idx]:.4f}, Recall={p_r_f[1][idx]:.4f}, F1={p_r_f[2][idx]:.4f}")
 
-    return mse, mae, r2, accuracy, predictions, true_labels
+print("\nConfusion matrix (tuned, rows=true, cols=pred):")
+print(confusion_matrix(y_test_true, preds_test_thresh))
 
-def plot_results(train_losses, val_losses, predictions, true_labels):
-    """Plot training curves, predictions, and confusion matrix"""
-    plt.figure(figsize=(15, 5))
+# ROC per class (using argmax preds for consistency, but probs for AUC)
+plt.figure(figsize=(8,6))
+aucs = []
+for cls in np.unique(y_full):
+    y_bin = (y_test_true == cls).astype(int)
+    scores = probs_test[:, int(cls)]
+    if len(np.unique(y_bin)) < 2:
+        print(f" - Class {cls}: not enough positive examples in test to compute ROC.")
+        auc_val = np.nan
+    else:
+        fpr, tpr, _ = roc_curve(y_bin, scores)
+        auc_val = auc(fpr, tpr)
+        plt.plot(fpr, tpr, label=f"Class {cls} (AUC={auc_val:.3f})")
+    aucs.append(auc_val)
+print("Macro AUC (mean of per-class AUCs, ignoring NaN):", np.nanmean(aucs))
+plt.plot([0,1],[0,1],'k--'); plt.legend(); plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "roc_multiclass.png"), dpi=150)
+plt.close()
+print("Saved ROC plot to", OUTPUT_DIR)
 
-    plt.subplot(1, 3, 1)
-    plt.plot(train_losses, label='Training Loss', alpha=0.7)
-    plt.plot(val_losses, label='Validation Loss', alpha=0.7)
-    plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss')
-    plt.title('Training Curves')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+# ---------------------------
+# 14) Save artifacts & feature list used
+# ---------------------------
+print("\n[11] Saving artifacts")
+torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "final_gwnn_enhanced.pt"))
+np.savez(os.path.join(OUTPUT_DIR, "gwnn_enhanced_info.npz"),
+         feature_list=np.array(available_features, dtype=object),
+         class_weights=class_weights_arr,
+         eigvals=eigvals, eigvecs=eigvecs,
+         best_thresh=best_thresh)
+print("Saved model, baseline, and data info to", OUTPUT_DIR)
 
-    plt.subplot(1, 3, 2)
-    plt.scatter(true_labels, predictions, alpha=0.6)
-    plt.plot([0, 1], [0, 1], 'r--', alpha=0.8)
-    plt.xlabel('True Values')
-    plt.ylabel('Predictions')
-    plt.title('Predictions vs True Values')
-    plt.grid(True, alpha=0.3)
-
-    plt.subplot(1, 3, 3)
-    pred_discrete = np.round(predictions * 2) / 2
-    pred_discrete = np.clip(pred_discrete, 0, 1)
-    cm = confusion_matrix(true_labels, pred_discrete, labels=[0.0, 0.5, 1.0])
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=['Not Resistant', 'Partial', 'Resistant'],
-                yticklabels=['Not Resistant', 'Partial', 'Resistant'])
-    plt.title('Confusion Matrix')
-    plt.ylabel('True')
-    plt.xlabel('Predicted')
-
-    plt.tight_layout()
-    plt.savefig('gwnn_results.png', dpi=300, bbox_inches='tight')
-    plt.show()
-
-def main():
-    """Main execution pipeline"""
-    print("=== Graph Wavelet Neural Network for Chemotherapy Resistance Prediction ===")
-
-    # Load and preprocess data
-    X, y, patient_ids = load_and_preprocess_data()
-
-    # Train/test split (70/30 = 200/86)
-    y_discrete = (y * 2).astype(int)
-    X_train, X_test, y_train, y_test, ids_train, ids_test = train_test_split(
-        X, y, patient_ids, test_size=0.3, random_state=42, stratify=y_discrete
-    )
-    X_train, X_val, y_train, y_val, ids_train, ids_val = train_test_split(
-        X_train, y_train, ids_train, test_size=0.2, random_state=42, stratify=(y_train * 2).astype(int)
-    )
-
-    print(f"Dataset splits - Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
-
-    # Build graph
-    edge_index = build_knn_graph(X, k=10)
-    eigenvals, eigenvecs = compute_laplacian_eigenvectors(edge_index, len(X), K=64)
-
-    # Create masks
-    train_mask = torch.zeros(len(X), dtype=torch.bool)
-    val_mask = torch.zeros(len(X), dtype=torch.bool)
-    test_mask = torch.zeros(len(X), dtype=torch.bool)
-    train_indices, val_indices, test_indices = [], [], []
-    for i, pid in enumerate(patient_ids):
-        if pid in ids_train:
-            train_indices.append(i)
-        elif pid in ids_val:
-            val_indices.append(i)
-        else:
-            test_indices.append(i)
-    train_mask[train_indices] = True
-    val_mask[val_indices] = True
-    test_mask[test_indices] = True
-
-    # Convert to tensors
-    X = torch.tensor(X, dtype=torch.float32)
-    y = torch.tensor(y, dtype=torch.float32)
-
-    # Initialize model
-    model = GWNN(input_dim=X.shape[1], hidden_dim=128, num_classes=1, num_wavelets=4, K=64, dropout=0.5)
-    print(f"Model initialized with {sum(p.numel() for p in model.parameters())} parameters")
-
-    # Train model
-    train_losses, val_losses = train_gwnn(model, X, y, eigenvals, eigenvecs, train_mask, val_mask)
-
-    # Evaluate
-    mse, mae, r2, accuracy, predictions, true_labels = evaluate_model(
-        model, X, y, eigenvals, eigenvecs, test_mask, ids_test
-    )
-
-    # Plot results
-    plot_results(train_losses, val_losses, predictions, true_labels)
-
-    print("\n" + "="*60)
-    print("GWNN Training Complete!")
-    print(f"Model trained. Test MSE: {mse:.4f}, R²: {r2:.4f}")
-    print(f"Test MAE: {mae:.4f}, Discretized Accuracy: {accuracy:.4f}")
-    print("="*60)
-
-    return model, mse, r2
-
-if __name__ == "__main__":
-    model, mse, r2 = main()
+print("\nPipeline complete.")
+print("="*80)
